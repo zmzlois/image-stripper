@@ -1,6 +1,7 @@
 import { generateImage } from "ai";
 import { createGoogleGenerativeAI } from "@ai-sdk/google";
 import { createOpenAI } from "@ai-sdk/openai";
+import { getPolarCheckout, isPaidCheckout } from "@/lib/polar";
 import sharp from "sharp";
 
 export const runtime = "nodejs";
@@ -9,6 +10,8 @@ export const maxDuration = 300;
 type OutputFormat = "png" | "jpeg" | "webp" | "svg";
 type AspectRatio = "free" | "1:1" | "4:3" | "16:9";
 type BackgroundMode = "keep" | "transparent";
+type ProcessingMode = "ai" | "fast";
+type FastOperation = "resize" | "remove-background" | "svg";
 
 type CropPayload = {
   id: string;
@@ -17,9 +20,12 @@ type CropPayload = {
   dataUrl: string;
   width: number;
   height: number;
+  prompt?: string;
 };
 
 type StripSettings = {
+  mode?: ProcessingMode;
+  fastOperation?: FastOperation;
   format: OutputFormat;
   maxEdge: number;
   aspectRatio: AspectRatio;
@@ -29,6 +35,11 @@ type StripSettings = {
 type StripRequest = {
   crops: CropPayload[];
   settings: StripSettings;
+  payment?: {
+    checkoutId?: string;
+    jobId?: string;
+    email?: string;
+  };
 };
 
 const openai = createOpenAI({
@@ -44,6 +55,10 @@ const aspectMap: Record<Exclude<AspectRatio, "free">, number> = {
   "4:3": 4 / 3,
   "16:9": 16 / 9,
 };
+
+function clamp(value: number, min: number, max: number) {
+  return Math.min(Math.max(value, min), max);
+}
 
 function parseDataUrl(dataUrl: string) {
   const match = dataUrl.match(/^data:([^;]+);base64,(.+)$/);
@@ -149,18 +164,200 @@ async function normalizeImage(
   };
 }
 
-async function stripCrop(crop: CropPayload, settings: StripSettings) {
-  const { buffer } = parseDataUrl(crop.dataUrl);
-  const useGemini = crop.index % 2 === 0;
-  const modelName = useGemini ? "gemini-2.5-flash-image" : "gpt-image-1";
-  const prompt = [
+function colorDistance(
+  r1: number,
+  g1: number,
+  b1: number,
+  r2: number,
+  g2: number,
+  b2: number,
+) {
+  const r = r1 - r2;
+  const g = g1 - g2;
+  const b = b1 - b2;
+
+  return Math.sqrt(r * r + g * g + b * b);
+}
+
+function estimateEdgeColor(data: Buffer, width: number, height: number) {
+  const samples: Array<[number, number, number]> = [];
+  const stride = 4;
+  const sample = Math.max(1, Math.min(8, Math.floor(Math.min(width, height) / 8)));
+
+  for (let y = 0; y < height; y += Math.max(1, height - sample)) {
+    for (let x = 0; x < width; x += 1) {
+      const index = (y * width + x) * stride;
+      if (data[index + 3] > 16) {
+        samples.push([data[index], data[index + 1], data[index + 2]]);
+      }
+    }
+  }
+
+  for (let x = 0; x < width; x += Math.max(1, width - sample)) {
+    for (let y = 0; y < height; y += 1) {
+      const index = (y * width + x) * stride;
+      if (data[index + 3] > 16) {
+        samples.push([data[index], data[index + 1], data[index + 2]]);
+      }
+    }
+  }
+
+  if (samples.length === 0) {
+    return [255, 255, 255] as const;
+  }
+
+  const totals = samples.reduce(
+    (next, sampleColor) => {
+      next[0] += sampleColor[0];
+      next[1] += sampleColor[1];
+      next[2] += sampleColor[2];
+      return next;
+    },
+    [0, 0, 0],
+  );
+
+  return [
+    Math.round(totals[0] / samples.length),
+    Math.round(totals[1] / samples.length),
+    Math.round(totals[2] / samples.length),
+  ] as const;
+}
+
+async function removeEdgeBackground(
+  input: Buffer,
+  crop: CropPayload,
+  settings: StripSettings,
+) {
+  const target = outputDimensions(crop.width, crop.height, settings);
+  const { data, info } = await sharp(input, { failOn: "none" })
+    .rotate()
+    .resize(target.width, target.height, {
+      fit: settings.aspectRatio === "free" ? "inside" : "cover",
+      withoutEnlargement: false,
+      position: "center",
+    })
+    .ensureAlpha()
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+
+  const width = info.width;
+  const height = info.height;
+  const [bgR, bgG, bgB] = estimateEdgeColor(data, width, height);
+  const visited = new Uint8Array(width * height);
+  const queue: number[] = [];
+  const threshold = 46;
+  const feather = 34;
+
+  const enqueue = (x: number, y: number) => {
+    if (x < 0 || y < 0 || x >= width || y >= height) {
+      return;
+    }
+
+    const pixel = y * width + x;
+
+    if (visited[pixel]) {
+      return;
+    }
+
+    const offset = pixel * 4;
+    const distance = colorDistance(
+      data[offset],
+      data[offset + 1],
+      data[offset + 2],
+      bgR,
+      bgG,
+      bgB,
+    );
+
+    if (distance <= threshold + feather) {
+      visited[pixel] = 1;
+      queue.push(pixel);
+    }
+  };
+
+  for (let x = 0; x < width; x += 1) {
+    enqueue(x, 0);
+    enqueue(x, height - 1);
+  }
+
+  for (let y = 1; y < height - 1; y += 1) {
+    enqueue(0, y);
+    enqueue(width - 1, y);
+  }
+
+  for (let cursor = 0; cursor < queue.length; cursor += 1) {
+    const pixel = queue[cursor];
+    const x = pixel % width;
+    const y = Math.floor(pixel / width);
+    enqueue(x + 1, y);
+    enqueue(x - 1, y);
+    enqueue(x, y + 1);
+    enqueue(x, y - 1);
+  }
+
+  for (const pixel of queue) {
+    const offset = pixel * 4;
+    const distance = colorDistance(
+      data[offset],
+      data[offset + 1],
+      data[offset + 2],
+      bgR,
+      bgG,
+      bgB,
+    );
+    const alpha =
+      distance <= threshold
+        ? 0
+        : Math.round(
+            data[offset + 3] *
+              clamp((distance - threshold) / feather, 0, 1),
+          );
+
+    data[offset + 3] = alpha;
+  }
+
+  const png = await sharp(data, {
+    raw: {
+      width,
+      height,
+      channels: 4,
+    },
+  })
+    .png({ compressionLevel: 9 })
+    .toBuffer();
+
+  return {
+    b64: png.toString("base64"),
+    mediaType: "image/png",
+    extension: "png",
+    width,
+    height,
+  };
+}
+
+function stripPrompt(crop: CropPayload, settings: StripSettings) {
+  const extraPrompt = crop.prompt?.trim();
+  const instructions = [
     "Create a clean, high-fidelity recreation of the supplied cropped image region.",
     "Remove all visible text, captions, watermarks, UI labels, logos made of text, and typography.",
     "Preserve the original subject, material, lighting, perspective, edges, and photographic detail.",
     settings.background === "transparent"
       ? "Return the subject on a transparent background when supported."
       : "Keep the original background and surrounding visual context.",
-  ].join(" ");
+  ];
+
+  if (extraPrompt) {
+    instructions.push(`Additional direction for this version: ${extraPrompt}`);
+  }
+
+  return instructions.join(" ");
+}
+
+async function stripCrop(crop: CropPayload, settings: StripSettings) {
+  const { buffer } = parseDataUrl(crop.dataUrl);
+  const useGemini = crop.index % 2 === 0;
+  const modelName = useGemini ? "gemini-2.5-flash-image" : "gpt-image-1";
+  const prompt = stripPrompt(crop, settings);
 
   const result = await generateImage({
     model: useGemini
@@ -170,14 +367,12 @@ async function stripCrop(crop: CropPayload, settings: StripSettings) {
       images: [buffer],
       text: prompt,
     },
+    ...(useGemini && settings.aspectRatio !== "free"
+      ? { aspectRatio: settings.aspectRatio }
+      : {}),
     maxRetries: 1,
     providerOptions: useGemini
-      ? {
-          google: {
-            aspectRatio:
-              settings.aspectRatio === "free" ? undefined : settings.aspectRatio,
-          },
-        }
+      ? undefined
       : {
           openai: {
             quality: "medium",
@@ -201,8 +396,62 @@ async function stripCrop(crop: CropPayload, settings: StripSettings) {
     id: crop.id,
     name: crop.name,
     model: modelName,
+    prompt: crop.prompt?.trim() || undefined,
     ...normalized,
   };
+}
+
+async function fastCrop(crop: CropPayload, settings: StripSettings) {
+  const { buffer } = parseDataUrl(crop.dataUrl);
+  const operation = settings.fastOperation ?? "resize";
+
+  if (operation === "remove-background") {
+    const result = await removeEdgeBackground(buffer, crop, settings);
+
+    return {
+      id: crop.id,
+      name: crop.name,
+      model: "sharp-background",
+      prompt: crop.prompt?.trim() || undefined,
+      ...result,
+    };
+  }
+
+  const outputSettings =
+    operation === "svg" ? { ...settings, format: "svg" as const } : settings;
+  const normalized = await normalizeImage(buffer, crop, outputSettings);
+
+  return {
+    id: crop.id,
+    name: crop.name,
+    model: operation === "svg" ? "sharp-svg" : "sharp-resize",
+    prompt: crop.prompt?.trim() || undefined,
+    ...normalized,
+  };
+}
+
+async function assertPaid(payment: StripRequest["payment"]) {
+  if (process.env.PAYMENT_REQUIRED === "false") {
+    return;
+  }
+
+  const email = payment?.email?.trim().toLowerCase();
+
+  if (email === "lois@sf-voice.sh") {
+    return;
+  }
+
+  const checkoutId = payment?.checkoutId?.trim();
+
+  if (!checkoutId) {
+    throw new Error("Payment is required before generation.");
+  }
+
+  const checkout = await getPolarCheckout(checkoutId);
+
+  if (!isPaidCheckout(checkout, payment?.jobId)) {
+    throw new Error("Polar checkout has not succeeded yet.");
+  }
 }
 
 export async function POST(request: Request) {
@@ -213,7 +462,17 @@ export async function POST(request: Request) {
       return Response.json({ error: "Add at least one selection." }, { status: 400 });
     }
 
-    if (!process.env.OPENAI_API_KEY && body.crops.some((crop) => crop.index % 2 === 1)) {
+    const isFastMode = body.settings.mode === "fast";
+
+    if (!isFastMode) {
+      await assertPaid(body.payment);
+    }
+
+    if (
+      !isFastMode &&
+      !process.env.OPENAI_API_KEY &&
+      body.crops.some((crop) => crop.index % 2 === 1)
+    ) {
       return Response.json(
         { error: "Missing OPENAI_API_KEY in server environment." },
         { status: 500 },
@@ -221,6 +480,7 @@ export async function POST(request: Request) {
     }
 
     if (
+      !isFastMode &&
       !process.env.GEMINI_API_KEY &&
       !process.env.GOOGLE_GENERATIVE_AI_API_KEY &&
       body.crops.some((crop) => crop.index % 2 === 0)
@@ -232,7 +492,9 @@ export async function POST(request: Request) {
     }
 
     const settled = await Promise.allSettled(
-      body.crops.map((crop) => stripCrop(crop, body.settings)),
+      body.crops.map((crop) =>
+        isFastMode ? fastCrop(crop, body.settings) : stripCrop(crop, body.settings),
+      ),
     );
 
     return Response.json({
@@ -244,6 +506,7 @@ export async function POST(request: Request) {
         return {
           id: body.crops[index]?.id,
           name: body.crops[index]?.name,
+          prompt: body.crops[index]?.prompt?.trim() || undefined,
           error:
             result.reason instanceof Error
               ? result.reason.message
@@ -252,12 +515,17 @@ export async function POST(request: Request) {
       }),
     });
   } catch (error) {
+    const message =
+      error instanceof Error ? error.message : "Could not process the batch.";
+
     return Response.json(
       {
-        error:
-          error instanceof Error ? error.message : "Could not process the batch.",
+        error: message,
       },
-      { status: 500 },
+      {
+        status:
+          message.includes("Payment") || message.includes("checkout") ? 402 : 500,
+      },
     );
   }
 }

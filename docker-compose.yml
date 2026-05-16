@@ -1,0 +1,21 @@
+services:
+  postgres:
+    build:
+      context: .
+      dockerfile: Dockerfile.postgres
+    environment:
+      POSTGRES_DB: image_stripper
+      POSTGRES_USER: image_stripper
+      POSTGRES_PASSWORD: image_stripper
+    ports:
+      - "5432:5432"
+    volumes:
+      - image-stripper-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U image_stripper -d image_stripper"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  image-stripper-postgres:
