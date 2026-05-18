@@ -341,9 +341,7 @@ export default function Home() {
             .then(() => loadHistory())
             .then(() => syncHistoryToVercelBlob(entry, email))
             .then((syncedToBlob) => {
-               setSaveNotice(
-                  syncedToBlob ? "Saved to" : "Saved on this browser.",
-               );
+               setSaveNotice(syncedToBlob ? "Saved" : "Saved on this browser.");
             })
             .catch(() =>
                setSaveNotice("Saved locally, failed to save to storage."),
