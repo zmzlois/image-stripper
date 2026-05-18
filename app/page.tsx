@@ -1684,7 +1684,8 @@ export default function Home() {
                ) : (
                   <>
                      <p className="mb-2 text-xs text-muted-foreground">
-                        Your results won&apos;t be saved permanently.
+                        Your results won&apos;t be saved permanently until you
+                        signed in.
                      </p>
                      <button
                         type="button"
