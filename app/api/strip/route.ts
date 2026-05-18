@@ -1,7 +1,16 @@
 import { generateImage } from "ai";
 import { createGoogleGenerativeAI } from "@ai-sdk/google";
 import { createOpenAI } from "@ai-sdk/openai";
-import { getPolarCheckout, isPaidCheckout } from "@/lib/polar";
+import {
+  customerCreditBalance,
+  hasActiveSubscription,
+  getPolarCheckout,
+  getPolarCustomerStateByExternalId,
+  hasLifetimeAccess,
+  ingestPolarUsageEvent,
+  isPaidCheckout,
+} from "@/lib/polar";
+import { authenticatedEmailFromRequest, isOwnerEmail } from "@/lib/auth";
 import sharp from "sharp";
 
 export const runtime = "nodejs";
@@ -12,6 +21,17 @@ type AspectRatio = "free" | "1:1" | "4:3" | "16:9";
 type BackgroundMode = "keep" | "transparent";
 type ProcessingMode = "ai" | "fast";
 type FastOperation = "resize" | "remove-background" | "svg";
+type ModelPreference =
+  | "rotate"
+  | "nano-banana-2"
+  | "nano-banana"
+  | "nano-banana-pro"
+  | "openai";
+type ImageModelId =
+  | "nano-banana-2"
+  | "nano-banana"
+  | "nano-banana-pro"
+  | "openai";
 
 type CropPayload = {
   id: string;
@@ -26,6 +46,7 @@ type CropPayload = {
 type StripSettings = {
   mode?: ProcessingMode;
   fastOperation?: FastOperation;
+  modelPreference?: ModelPreference;
   format: OutputFormat;
   maxEdge: number;
   aspectRatio: AspectRatio;
@@ -353,15 +374,46 @@ function stripPrompt(crop: CropPayload, settings: StripSettings) {
   return instructions.join(" ");
 }
 
+function imageModelForCrop(crop: CropPayload, settings: StripSettings): ImageModelId {
+  const preference = settings.modelPreference ?? "rotate";
+
+  if (preference !== "rotate") {
+    return preference;
+  }
+
+  return ([
+    "nano-banana-2",
+    "openai",
+    "nano-banana",
+    "nano-banana-pro",
+  ] as const)[crop.index % 4];
+}
+
+function batchNeedsOpenAi(crops: CropPayload[], settings: StripSettings) {
+  return crops.some((crop) => imageModelForCrop(crop, settings) === "openai");
+}
+
+function batchNeedsGemini(crops: CropPayload[], settings: StripSettings) {
+  return crops.some((crop) => imageModelForCrop(crop, settings) !== "openai");
+}
+
 async function stripCrop(crop: CropPayload, settings: StripSettings) {
   const { buffer } = parseDataUrl(crop.dataUrl);
-  const useGemini = crop.index % 2 === 0;
-  const modelName = useGemini ? "gemini-2.5-flash-image" : "gpt-image-1";
+  const modelId = imageModelForCrop(crop, settings);
+  const modelName =
+    modelId === "nano-banana-2"
+      ? "gemini-3.1-flash-image-preview"
+      : modelId === "nano-banana"
+        ? "gemini-2.5-flash-image"
+      : modelId === "nano-banana-pro"
+        ? "gemini-3-pro-image-preview"
+        : "gpt-image-1";
+  const useGemini = modelId !== "openai";
   const prompt = stripPrompt(crop, settings);
 
   const result = await generateImage({
     model: useGemini
-      ? google.image("gemini-2.5-flash-image")
+      ? google.image(modelName)
       : openai.image("gpt-image-1"),
     prompt: {
       images: [buffer],
@@ -430,15 +482,41 @@ async function fastCrop(crop: CropPayload, settings: StripSettings) {
   };
 }
 
-async function assertPaid(payment: StripRequest["payment"]) {
+async function assertPaid(
+  payment: StripRequest["payment"],
+  requiredCredits: number,
+  authenticatedEmail: string | null,
+) {
   if (process.env.PAYMENT_REQUIRED === "false") {
     return;
   }
 
   const email = payment?.email?.trim().toLowerCase();
 
-  if (email === "lois@sf-voice.sh") {
+  if (!email || authenticatedEmail !== email) {
+    throw new Error("Sign in before generation.");
+  }
+
+  if (isOwnerEmail(email)) {
     return;
+  }
+
+  if (email) {
+    const customerState = await getPolarCustomerStateByExternalId(email).catch(
+      () => null,
+    );
+
+    if (customerState) {
+      if (hasLifetimeAccess(customerState) || hasActiveSubscription(customerState)) {
+        return;
+      }
+
+      const balance = customerCreditBalance(customerState);
+
+      if (balance !== null && balance >= requiredCredits) {
+        return;
+      }
+    }
   }
 
   const checkoutId = payment?.checkoutId?.trim();
@@ -454,24 +532,75 @@ async function assertPaid(payment: StripRequest["payment"]) {
   }
 }
 
+async function recordGenerationUsage(
+  payment: StripRequest["payment"],
+  jobId: string | undefined,
+  requestedCount: number,
+  fulfilledCount: number,
+) {
+  const email = payment?.email?.trim().toLowerCase();
+
+  if (
+    !email ||
+    isOwnerEmail(email) ||
+    process.env.PAYMENT_REQUIRED === "false"
+  ) {
+    return;
+  }
+
+  const customerState = await getPolarCustomerStateByExternalId(email).catch(
+    () => null,
+  );
+
+  if (
+    customerState &&
+    (hasLifetimeAccess(customerState) || hasActiveSubscription(customerState))
+  ) {
+    return;
+  }
+
+  await ingestPolarUsageEvent({
+    email,
+    jobId,
+    credits: requestedCount,
+    selectionCount: requestedCount,
+    fulfilledCount,
+    failedCount: Math.max(0, requestedCount - fulfilledCount),
+  }).catch((error) => {
+    console.error("polar.usage_ingest_failed", error);
+  });
+}
+
 export async function POST(request: Request) {
   try {
     const body = (await request.json()) as StripRequest;
+    const authenticatedEmail = authenticatedEmailFromRequest(request);
+
+    console.log("strip.attempt", {
+      email: body.payment?.email,
+      authenticatedEmail,
+      cropCount: body.crops?.length ?? 0,
+      mode: body.settings.mode,
+      fastOperation: body.settings.fastOperation,
+      modelPreference: body.settings.modelPreference,
+      format: body.settings.format,
+      jobId: body.payment?.jobId,
+      checkoutId: body.payment?.checkoutId,
+    });
 
     if (!body.crops?.length) {
+      console.log("strip.rejected", { reason: "no_crops", email: body.payment?.email });
       return Response.json({ error: "Add at least one selection." }, { status: 400 });
     }
 
     const isFastMode = body.settings.mode === "fast";
 
-    if (!isFastMode) {
-      await assertPaid(body.payment);
-    }
+    await assertPaid(body.payment, body.crops.length, authenticatedEmail);
 
     if (
       !isFastMode &&
       !process.env.OPENAI_API_KEY &&
-      body.crops.some((crop) => crop.index % 2 === 1)
+      batchNeedsOpenAi(body.crops, body.settings)
     ) {
       return Response.json(
         { error: "Missing OPENAI_API_KEY in server environment." },
@@ -483,7 +612,7 @@ export async function POST(request: Request) {
       !isFastMode &&
       !process.env.GEMINI_API_KEY &&
       !process.env.GOOGLE_GENERATIVE_AI_API_KEY &&
-      body.crops.some((crop) => crop.index % 2 === 0)
+      batchNeedsGemini(body.crops, body.settings)
     ) {
       return Response.json(
         { error: "Missing GEMINI_API_KEY in server environment." },
@@ -495,6 +624,41 @@ export async function POST(request: Request) {
       body.crops.map((crop) =>
         isFastMode ? fastCrop(crop, body.settings) : stripCrop(crop, body.settings),
       ),
+    );
+    const fulfilledCount = settled.filter(
+      (result) => result.status === "fulfilled",
+    ).length;
+    const failedCount = body.crops.length - fulfilledCount;
+
+    console.log("strip.complete", {
+      email: body.payment?.email,
+      cropCount: body.crops.length,
+      fulfilledCount,
+      failedCount,
+      jobId: body.payment?.jobId,
+    });
+
+    if (failedCount > 0) {
+      settled.forEach((result, index) => {
+        if (result.status === "rejected") {
+          console.error("strip.crop_failed", {
+            index,
+            cropId: body.crops[index]?.id,
+            cropName: body.crops[index]?.name,
+            error:
+              result.reason instanceof Error
+                ? result.reason.message
+                : String(result.reason),
+          });
+        }
+      });
+    }
+
+    await recordGenerationUsage(
+      body.payment,
+      body.payment?.jobId,
+      body.crops.length,
+      fulfilledCount,
     );
 
     return Response.json({
@@ -517,6 +681,11 @@ export async function POST(request: Request) {
   } catch (error) {
     const message =
       error instanceof Error ? error.message : "Could not process the batch.";
+
+    console.error("strip.error", {
+      email: (error as { email?: string })?.email,
+      error: message,
+    });
 
     return Response.json(
       {

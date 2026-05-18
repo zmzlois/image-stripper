@@ -4,16 +4,13 @@
 
 import JSZip from "jszip";
 import {
-   Archive,
    Clipboard,
    CreditCard,
-   Download,
    FileImage,
    ImagePlus,
-   Loader2,
-   Mail,
+   LogOut,
    Play,
-   RefreshCw,
+   Settings,
    Trash2,
    Upload,
    User,
@@ -27,64 +24,51 @@ import {
    useState,
    type PointerEvent as ReactPointerEvent,
 } from "react";
-
-type OutputFormat = "png" | "jpeg" | "webp" | "svg";
-type AspectRatio = "free" | "1:1" | "4:3" | "16:9";
-type BackgroundMode = "keep" | "transparent";
-type ProcessingMode = "ai" | "fast";
-type FastOperation = "resize" | "remove-background" | "svg";
-type PricingPlanId = "starter" | "pro" | "studio";
-
-type SourceImage = {
-   name: string;
-   dataUrl: string;
-};
-
-type Selection = {
-   id: string;
-   name: string;
-   x: number;
-   y: number;
-   w: number;
-   h: number;
-};
-
-type StripSettings = {
-   mode: ProcessingMode;
-   fastOperation: FastOperation;
-   format: OutputFormat;
-   maxEdge: number;
-   aspectRatio: AspectRatio;
-   background: BackgroundMode;
-};
-
-type StripResult = {
-   id: string;
-   name: string;
-   model?: string;
-   prompt?: string;
-   b64?: string;
-   mediaType?: string;
-   extension?: string;
-   width?: number;
-   height?: number;
-   error?: string;
-   status?: "processing";
-};
-
-type HistoryEntry = {
-   id: string;
-   createdAt: number;
-   source: SourceImage;
-   selections: Selection[];
-   settings: StripSettings;
-   results: StripResult[];
-   payment?: {
-      checkoutId?: string;
-      email?: string;
-      status?: "pending" | "paid";
-   };
-};
+import {
+   OutputPanel,
+} from "@/components/image-stripper/output-panel";
+import {
+   PaymentModal,
+   SettingsModal,
+   UserModal,
+} from "@/components/image-stripper/modals";
+import {
+   aspectOptions,
+   defaultSettings,
+   fastOptions,
+   formatOptions,
+   maxEdgeOptions,
+   normalizeSettings,
+   pricingPlans,
+} from "@/lib/image-stripper/config";
+import {
+   deleteHistory,
+   getHistory,
+   listHistory,
+   putHistory,
+   syncHistoryToVercelBlob,
+} from "@/lib/image-stripper/history";
+import type {
+   AuthMode,
+   BackgroundMode,
+   BillingState,
+   CheckoutIntent,
+   HistoryEntry,
+   OutputFormat,
+   PricingPlanId,
+   ProcessingMode,
+   Selection,
+   SourceImage,
+   StripResult,
+   StripSettings,
+} from "@/lib/image-stripper/types";
+import {
+   clamp,
+   isSuperAdminEmail,
+   makeId,
+   pluralCredits,
+   slug,
+} from "@/lib/image-stripper/utils";
 
 type DragState =
    | {
@@ -107,71 +91,6 @@ type DragState =
         startY: number;
         original: Selection;
      };
-
-const defaultSettings: StripSettings = {
-   mode: "ai",
-   fastOperation: "resize",
-   format: "png",
-   maxEdge: 1024,
-   aspectRatio: "free",
-   background: "keep",
-};
-
-function normalizeSettings(
-   settings: Partial<StripSettings> | undefined,
-): StripSettings {
-   return {
-      ...defaultSettings,
-      ...settings,
-   };
-}
-
-const maxEdgeOptions = [512, 768, 1024, 1536, 2048];
-const aspectOptions: AspectRatio[] = ["free", "1:1", "4:3", "16:9"];
-const formatOptions: OutputFormat[] = ["png", "webp", "jpeg", "svg"];
-const fastOptions: Array<{ value: FastOperation; label: string }> = [
-   { value: "resize", label: "Resize" },
-   { value: "remove-background", label: "Remove bg" },
-   { value: "svg", label: "SVG" },
-];
-const pricingPlans: Array<{
-   id: PricingPlanId;
-   name: string;
-   price: string;
-   credits: string;
-   note: string;
-}> = [
-   {
-      id: "starter",
-      name: "Starter",
-      price: "$9",
-      credits: "20 credits",
-      note: "Best for this batch",
-   },
-   {
-      id: "pro",
-      name: "Pro",
-      price: "$19",
-      credits: "60 credits",
-      note: "Most popular",
-   },
-   {
-      id: "studio",
-      name: "Studio",
-      price: "$49",
-      credits: "200 credits",
-      note: "Bulk work",
-   },
-];
-const superAdminEmails = new Set(["lois@sf-voice.sh"]);
-
-function makeId(prefix: string) {
-   return `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-}
-
-function clamp(value: number, min: number, max: number) {
-   return Math.min(Math.max(value, min), max);
-}
 
 function pointFromSvg(
    svg: SVGSVGElement | null,
@@ -198,99 +117,11 @@ function pointFromSvg(
    };
 }
 
-function slug(value: string) {
-   return value
-      .trim()
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, "-")
-      .replace(/(^-|-$)/g, "");
-}
-
-function resultDataUrl(result: StripResult) {
-   if (!result.b64 || !result.mediaType) {
-      return "";
-   }
-
-   return `data:${result.mediaType};base64,${result.b64}`;
-}
-
 function downloadDataUrl(dataUrl: string, filename: string) {
    const anchor = document.createElement("a");
    anchor.href = dataUrl;
    anchor.download = filename;
    anchor.click();
-}
-
-function isSuperAdminEmail(email: string) {
-   return superAdminEmails.has(email.trim().toLowerCase());
-}
-
-function openHistoryDb() {
-   return new Promise<IDBDatabase>((resolve, reject) => {
-      const request = indexedDB.open("image-stripper", 1);
-
-      request.onupgradeneeded = () => {
-         request.result.createObjectStore("jobs", { keyPath: "id" });
-      };
-
-      request.onerror = () => reject(request.error);
-      request.onsuccess = () => resolve(request.result);
-   });
-}
-
-async function putHistory(entry: HistoryEntry) {
-   const db = await openHistoryDb();
-
-   await new Promise<void>((resolve, reject) => {
-      const tx = db.transaction("jobs", "readwrite");
-      tx.objectStore("jobs").put(entry);
-      tx.oncomplete = () => resolve();
-      tx.onerror = () => reject(tx.error);
-   });
-
-   db.close();
-}
-
-async function deleteHistory(id: string) {
-   const db = await openHistoryDb();
-
-   await new Promise<void>((resolve, reject) => {
-      const tx = db.transaction("jobs", "readwrite");
-      tx.objectStore("jobs").delete(id);
-      tx.oncomplete = () => resolve();
-      tx.onerror = () => reject(tx.error);
-   });
-
-   db.close();
-}
-
-async function getHistory(id: string) {
-   const db = await openHistoryDb();
-   const entry = await new Promise<HistoryEntry | undefined>(
-      (resolve, reject) => {
-         const request = db.transaction("jobs").objectStore("jobs").get(id);
-
-         request.onerror = () => reject(request.error);
-         request.onsuccess = () =>
-            resolve(request.result as HistoryEntry | undefined);
-      },
-   );
-
-   db.close();
-   return entry;
-}
-
-async function listHistory() {
-   const db = await openHistoryDb();
-   const entries = await new Promise<HistoryEntry[]>((resolve, reject) => {
-      const request = db.transaction("jobs").objectStore("jobs").getAll();
-
-      request.onerror = () => reject(request.error);
-      request.onsuccess = () => resolve(request.result as HistoryEntry[]);
-   });
-
-   db.close();
-   return entries.sort((a, b) => b.createdAt - a.createdAt).slice(0, 20);
 }
 
 export default function Home() {
@@ -310,17 +141,22 @@ export default function Home() {
    const [batchError, setBatchError] = useState("");
    const [paymentNotice, setPaymentNotice] = useState("");
    const [paymentModalOpen, setPaymentModalOpen] = useState(false);
-   const [checkoutEmail, setCheckoutEmail] = useState(() =>
-      typeof window === "undefined"
-         ? ""
-         : (localStorage.getItem("image-stripper-email") ?? ""),
-   );
+   const [checkoutEmail, setCheckoutEmail] = useState("");
+   const [checkoutPassword, setCheckoutPassword] = useState("");
    const [checkoutError, setCheckoutError] = useState("");
+   const [authMode, setAuthMode] = useState<AuthMode>("sign-in");
    const [userModalOpen, setUserModalOpen] = useState(false);
+   const [userMenuOpen, setUserMenuOpen] = useState(false);
+   const [settingsModalOpen, setSettingsModalOpen] = useState(false);
+   const [saveNotice, setSaveNotice] = useState("");
    const [isCheckoutLoading, setIsCheckoutLoading] = useState(false);
-   const [selectedPlanId, setSelectedPlanId] = useState<PricingPlanId>("pro");
+   const [checkoutIntent, setCheckoutIntent] = useState<CheckoutIntent>("job");
+   const [selectedPlanId, setSelectedPlanId] =
+      useState<PricingPlanId>("monthly");
    const [paidCheckoutId, setPaidCheckoutId] = useState<string | null>(null);
    const [paidJobId, setPaidJobId] = useState<string | null>(null);
+   const [billingState, setBillingState] = useState<BillingState | null>(null);
+   const [billingRefreshKey, setBillingRefreshKey] = useState(0);
 
    const imageRef = useRef<HTMLImageElement>(null);
    const svgRef = useRef<SVGSVGElement>(null);
@@ -351,7 +187,38 @@ export default function Home() {
       currentJobId && paidCheckoutId && paidJobId === currentJobId,
    );
    const isSuperAdmin = isSuperAdminEmail(checkoutEmail);
-   const canGenerateAi = hasPaidForCurrentJob || isSuperAdmin;
+   const normalizedCheckoutEmail = checkoutEmail.trim().toLowerCase();
+   const billingStateMatchesEmail =
+      billingState &&
+      "email" in billingState &&
+      billingState.email === normalizedCheckoutEmail;
+   const creditBalance =
+      billingStateMatchesEmail && billingState.kind === "credits"
+         ? billingState.balance
+         : null;
+   const hasUnlimitedBilling =
+      billingStateMatchesEmail && billingState.kind === "unlimited";
+   const canGenerateSingleAi =
+      hasPaidForCurrentJob ||
+      isSuperAdmin ||
+      hasUnlimitedBilling ||
+      (creditBalance !== null && creditBalance >= 1);
+   const canGenerateCurrentBatch =
+      hasPaidForCurrentJob ||
+      isSuperAdmin ||
+      hasUnlimitedBilling ||
+      (creditBalance !== null && creditBalance >= selections.length);
+   const canGenerateAi = canGenerateSingleAi || canGenerateCurrentBatch;
+   const billingUsageNotice =
+      selections.length === 0
+         ? ""
+         : billingStateMatchesEmail && billingState.kind === "credits"
+           ? `This generation will cost ${pluralCredits(
+                selections.length,
+             )}. You have ${pluralCredits(billingState.balance)} left.`
+           : hasUnlimitedBilling && !isSuperAdmin
+             ? `Unlimited usage: ${billingState.label}.`
+             : "";
 
    const commitResults = useCallback(
       (nextResults: Record<string, StripResult>) => {
@@ -364,6 +231,59 @@ export default function Home() {
    useEffect(() => {
       resultsRef.current = results;
    }, [results]);
+
+   useEffect(() => {
+      const restoreEmail = window.setTimeout(() => {
+         setCheckoutEmail(localStorage.getItem("image-stripper-email") ?? "");
+      }, 0);
+
+      return () => window.clearTimeout(restoreEmail);
+   }, []);
+
+   useEffect(() => {
+      const email = checkoutEmail.trim().toLowerCase();
+
+      if (!email) {
+         return;
+      }
+
+      let active = true;
+
+      fetch("/api/billing/state")
+         .then(async (response) => {
+            const payload = (await response
+               .json()
+               .catch(() => null)) as BillingState | null;
+
+            if (
+               !active ||
+               !response.ok ||
+               !payload ||
+               payload.kind === "anonymous"
+            ) {
+               return;
+            }
+
+            if (
+               "email" in payload &&
+               payload.email &&
+               payload.email !== email
+            ) {
+               return;
+            }
+
+            setBillingState(payload);
+         })
+         .catch(() => {
+            if (active) {
+               setBillingState(null);
+            }
+         });
+
+      return () => {
+         active = false;
+      };
+   }, [billingRefreshKey, checkoutEmail, paidCheckoutId, paymentNotice]);
 
    const loadHistory = useCallback(async () => {
       try {
@@ -392,6 +312,58 @@ export default function Home() {
          active = false;
       };
    }, []);
+
+   useEffect(() => {
+      const email = checkoutEmail.trim().toLowerCase();
+
+      if (!email || !source || !currentJobId) {
+         return;
+      }
+
+      const entry: HistoryEntry = {
+         id: currentJobId,
+         createdAt: Date.now(),
+         source,
+         selections,
+         settings,
+         results: selections
+            .map((selection) => resultsRef.current[selection.id])
+            .filter(Boolean),
+         payment: {
+            checkoutId: paidCheckoutId ?? undefined,
+            email,
+            status:
+               paidCheckoutId && paidJobId === currentJobId
+                  ? "paid"
+                  : "pending",
+         },
+      };
+      const saveTimer = window.setTimeout(() => {
+         void putHistory(entry)
+            .then(() => loadHistory())
+            .then(() => syncHistoryToVercelBlob(entry, email))
+            .then((syncedToBlob) => {
+               setSaveNotice(
+                  syncedToBlob
+                     ? "Saved to Vercel Blob."
+                     : "Saved on this browser.",
+               );
+            })
+            .catch(() => setSaveNotice("Saved locally. Blob save failed."));
+      }, 500);
+
+      return () => window.clearTimeout(saveTimer);
+   }, [
+      checkoutEmail,
+      currentJobId,
+      loadHistory,
+      paidCheckoutId,
+      paidJobId,
+      results,
+      selections,
+      settings,
+      source,
+   ]);
 
    const loadFile = useCallback(
       (file: File) => {
@@ -729,7 +701,9 @@ export default function Home() {
    );
 
    const startPolarCheckout = async () => {
-      if (!source || selections.length === 0) {
+      const billingOnly = checkoutIntent === "billing";
+
+      if (!billingOnly && (!source || selections.length === 0)) {
          setCheckoutError("Load an image and select at least one section.");
          return;
       }
@@ -737,18 +711,29 @@ export default function Home() {
       const email = checkoutEmail.trim().toLowerCase();
 
       if (!email || !email.includes("@")) {
-         setCheckoutError("Enter an email so the paid job can be recovered.");
+         setCheckoutError(
+            billingOnly
+               ? "Enter an email for billing."
+               : "Enter an email so the paid job can be recovered.",
+         );
          return;
       }
 
-      const jobId = currentJobId ?? makeId("job");
-      setCurrentJobId(jobId);
+      const jobId = billingOnly ? undefined : (currentJobId ?? makeId("job"));
+
+      if (jobId) {
+         setCurrentJobId(jobId);
+      }
+
       setCheckoutError("");
       setIsCheckoutLoading(true);
 
       try {
          localStorage.setItem("image-stripper-email", email);
-         await saveDraft(jobId, email);
+
+         if (jobId) {
+            await saveDraft(jobId, email);
+         }
 
          const response = await fetch("/api/checkout/polar", {
             method: "POST",
@@ -756,8 +741,9 @@ export default function Home() {
             body: JSON.stringify({
                jobId,
                email,
-               selectionCount: selections.length,
+               selectionCount: billingOnly ? 0 : selections.length,
                plan: selectedPlanId,
+               billingOnly,
             }),
          });
          const payload = (await response.json()) as {
@@ -781,18 +767,129 @@ export default function Home() {
       }
    };
 
-   const saveUserEmail = () => {
+   const saveUserEmail = async ({
+      closeUserModal = true,
+   }: { closeUserModal?: boolean } = {}) => {
       const email = checkoutEmail.trim().toLowerCase();
 
       if (!email || !email.includes("@")) {
          setCheckoutError("Enter a valid email.");
-         return;
+         return false;
       }
 
-      localStorage.setItem("image-stripper-email", email);
-      setCheckoutEmail(email);
+      if (!isSuperAdminEmail(email) && !checkoutPassword) {
+         setCheckoutError(
+            authMode === "sign-up" ? "Choose a password." : "Enter your password.",
+         );
+         return false;
+      }
+
+      if (
+         authMode === "sign-up" &&
+         !isSuperAdminEmail(email) &&
+         checkoutPassword.length < 8
+      ) {
+         setCheckoutError("Use at least 8 characters.");
+         return false;
+      }
+
+      try {
+         const isOwner = isSuperAdminEmail(email);
+         const endpoint =
+            authMode === "sign-up" && !isOwner
+               ? "/api/auth/sign-up"
+               : "/api/auth/sign-in";
+         const response = await fetch(endpoint, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+               email,
+               password: checkoutPassword,
+            }),
+         });
+         const payload = (await response.json()) as {
+            email?: string;
+            error?: string;
+         };
+
+         if (!response.ok || !payload.email) {
+            // account already exists — switch to sign-in so the user has a clear path forward
+            if (response.status === 409 && authMode === "sign-up") {
+               setAuthMode("sign-in");
+               setCheckoutError(
+                  "That account already exists. Enter your password to sign in.",
+               );
+               return false;
+            }
+
+            throw new Error(
+               payload.error ||
+                  (authMode === "sign-up"
+                     ? "Could not create this account."
+                     : "Could not sign in."),
+            );
+         }
+
+         localStorage.setItem("image-stripper-email", payload.email);
+         setCheckoutEmail(payload.email);
+         setBillingRefreshKey((current) => current + 1);
+         setCheckoutPassword("");
+         setCheckoutError("");
+         setUserMenuOpen(false);
+         if (closeUserModal) {
+            setUserModalOpen(false);
+         }
+         return true;
+      } catch (error) {
+         setCheckoutError(
+            error instanceof Error
+               ? error.message
+               : authMode === "sign-up"
+                 ? "Could not create this account."
+                 : "Could not sign in.",
+         );
+         return false;
+      }
+   };
+
+   const continueCheckout = async () => {
+      const needsAuth =
+         authMode === "sign-up" ||
+         checkoutPassword ||
+         isSuperAdminEmail(checkoutEmail) ||
+         !billingStateMatchesEmail;
+
+      if (needsAuth) {
+         const signedIn = await saveUserEmail({ closeUserModal: false });
+
+         if (!signedIn) {
+            return;
+         }
+      }
+
+      await startPolarCheckout();
+   };
+
+   const signOutUser = async () => {
+      await fetch("/api/auth/sign-out", { method: "POST" }).catch(() => {});
+      localStorage.removeItem("image-stripper-email");
+      setCheckoutEmail("");
+      setBillingState(null);
+      setCheckoutPassword("");
+      setPaidCheckoutId(null);
+      setPaidJobId(null);
       setCheckoutError("");
+      setPaymentNotice("");
+      setUserMenuOpen(false);
       setUserModalOpen(false);
+   };
+
+   const openBilling = () => {
+      setCheckoutIntent("billing");
+      setAuthMode(checkoutEmail ? "sign-in" : "sign-up");
+      setCheckoutError("");
+      setUserMenuOpen(false);
+      setPaymentModalOpen(true);
    };
 
    const generateBatch = async () => {
@@ -801,7 +898,9 @@ export default function Home() {
          return;
       }
 
-      if (!isFastMode && !canGenerateAi) {
+      if (!canGenerateCurrentBatch) {
+         setCheckoutIntent("job");
+         setAuthMode(checkoutEmail ? "sign-in" : "sign-up");
          setPaymentModalOpen(true);
          setCheckoutError("");
          return;
@@ -866,6 +965,14 @@ export default function Home() {
 
          const merged = { ...resultsRef.current, ...nextResults };
          commitResults(merged);
+         setBillingState((current) =>
+            current?.kind === "credits"
+               ? {
+                    ...current,
+                    balance: Math.max(0, current.balance - crops.length),
+                 }
+               : current,
+         );
          await saveJob(merged);
       } catch (error) {
          const message =
@@ -890,7 +997,9 @@ export default function Home() {
          return;
       }
 
-      if (!isFastMode && !canGenerateAi) {
+      if (!canGenerateSingleAi) {
+         setCheckoutIntent("job");
+         setAuthMode(checkoutEmail ? "sign-in" : "sign-up");
          setPaymentModalOpen(true);
          setCheckoutError("");
          return;
@@ -951,6 +1060,14 @@ export default function Home() {
 
          const merged = { ...resultsRef.current, [selection.id]: result };
          commitResults(merged);
+         setBillingState((current) =>
+            current?.kind === "credits"
+               ? {
+                    ...current,
+                    balance: Math.max(0, current.balance - 1),
+                 }
+               : current,
+         );
          await saveJob(merged);
       } catch (error) {
          const message =
@@ -1020,13 +1137,14 @@ export default function Home() {
       const params = new URLSearchParams(window.location.search);
       const checkoutId = params.get("checkout_id");
       const jobId = params.get("job");
+      const billingOnly = params.get("billing") === "1";
 
-      if (!checkoutId || !jobId) {
+      if (!checkoutId || (!jobId && !billingOnly)) {
          return;
       }
 
       const verifiedCheckoutId = checkoutId;
-      const verifiedJobId = jobId;
+      const verifiedJobId = jobId ?? "";
       let active = true;
 
       async function restorePaidJob() {
@@ -1034,7 +1152,11 @@ export default function Home() {
             const response = await fetch(
                `/api/checkout/polar/status?checkout_id=${encodeURIComponent(
                   verifiedCheckoutId,
-               )}&job=${encodeURIComponent(verifiedJobId)}`,
+               )}${
+                  verifiedJobId
+                     ? `&job=${encodeURIComponent(verifiedJobId)}`
+                     : ""
+               }`,
             );
             const payload = (await response.json()) as {
                paid?: boolean;
@@ -1048,7 +1170,9 @@ export default function Home() {
                );
             }
 
-            const entry = await getHistory(verifiedJobId);
+            const entry = verifiedJobId
+               ? await getHistory(verifiedJobId)
+               : null;
 
             if (!active) {
                return;
@@ -1082,19 +1206,24 @@ export default function Home() {
                setSelectedId(entry.selections[0]?.id ?? null);
             }
 
-            setCurrentJobId(verifiedJobId);
             setPaidCheckoutId(verifiedCheckoutId);
-            setPaidJobId(verifiedJobId);
+            if (verifiedJobId) {
+               setCurrentJobId(verifiedJobId);
+               setPaidJobId(verifiedJobId);
+            }
             if (payload.email) {
                setCheckoutEmail(payload.email);
                localStorage.setItem("image-stripper-email", payload.email);
             }
+            setBillingRefreshKey((current) => current + 1);
             setPaymentModalOpen(false);
             setBatchError("");
             setPaymentNotice(
-               entry
-                  ? "Payment confirmed. Generate batch to start."
-                  : "Payment confirmed, but this browser no longer has the original image.",
+               billingOnly
+                  ? "Billing updated."
+                  : entry
+                    ? "Payment confirmed. Generate batch to start."
+                    : "Payment confirmed, but this browser no longer has the original image.",
             );
             await loadHistory();
             window.history.replaceState({}, "", window.location.pathname);
@@ -1133,6 +1262,7 @@ export default function Home() {
                   type="button"
                   onClick={() => {
                      setCheckoutError("");
+                     setAuthMode("sign-in");
                      setUserModalOpen(true);
                   }}
                   className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md border bg-surface text-muted-foreground transition-colors duration-150 hover:bg-surface-hover hover:text-foreground"
@@ -1148,7 +1278,7 @@ export default function Home() {
                   <button
                      type="button"
                      onClick={() => fileInputRef.current?.click()}
-                     className="flex h-8 w-full items-center justify-center gap-2 rounded-md bg-accent px-3 text-[13px] font-medium text-accent-foreground transition-colors duration-150 hover:bg-accent-hover"
+                     className="flex h-8 w-full items-center justify-center gap-2 rounded-md bg-surface px-3 text-[13px] font-medium text-foreground border transition-colors duration-150 hover:bg-surface-hover"
                   >
                      <Upload size={14} />
                      Upload image
@@ -1434,13 +1564,19 @@ export default function Home() {
                      disabled={!source || selections.length === 0}
                      className="flex h-8 w-full items-center justify-center gap-2 rounded-md bg-accent px-3 text-[13px] font-medium text-accent-foreground transition-colors duration-150 hover:bg-accent-hover disabled:cursor-not-allowed disabled:bg-surface disabled:text-subtle-foreground"
                   >
-                     {isFastMode || canGenerateAi ? (
+                     {isFastMode || canGenerateCurrentBatch ? (
                         <Play size={14} />
                      ) : (
                         <CreditCard size={14} />
                      )}
                      {isFastMode ? "Run fast tool" : "Generate"}
                   </button>
+
+                  {billingUsageNotice ? (
+                     <p className="rounded-md border bg-surface px-3 py-2 text-xs text-muted-foreground">
+                        {billingUsageNotice}
+                     </p>
+                  ) : null}
 
                   {isSuperAdmin ? (
                      <p className="rounded-md border border-success/50 bg-surface px-3 py-2 text-xs text-success">
@@ -1452,6 +1588,12 @@ export default function Home() {
                   {paymentNotice ? (
                      <p className="rounded-md border border-success/50 bg-surface px-3 py-2 text-xs text-success">
                         {paymentNotice}
+                     </p>
+                  ) : null}
+
+                  {saveNotice ? (
+                     <p className="rounded-md border bg-surface px-3 py-2 text-xs text-muted-foreground">
+                        {saveNotice}
                      </p>
                   ) : null}
 
@@ -1498,13 +1640,86 @@ export default function Home() {
                   </div>
                </div>
             </div>
+
+            <div className="relative border-t px-3 py-3">
+               {checkoutEmail ? (
+                  <>
+                     <button
+                        type="button"
+                        onClick={() => setUserMenuOpen((open) => !open)}
+                        className="flex h-8 w-full items-center justify-start gap-2 rounded-md border bg-surface px-3 text-[13px] font-medium text-foreground transition-colors duration-150 hover:bg-surface-hover"
+                     >
+                        <User size={14} />
+                        <span className="min-w-0 flex-1 truncate text-left">
+                           {checkoutEmail}
+                        </span>
+                     </button>
+
+                     {userMenuOpen ? (
+                        <div className="absolute bottom-[52px] left-3 right-3 z-20 rounded-lg border bg-[#0A0A0A] p-1">
+                           <button
+                              type="button"
+                              onClick={openBilling}
+                              className="flex h-8 w-full items-center gap-2 rounded-md px-2 text-left text-[13px] text-muted-foreground transition-colors duration-150 hover:bg-surface-hover hover:text-foreground"
+                           >
+                              <CreditCard size={14} />
+                              Billing
+                           </button>
+                           <button
+                              type="button"
+                              onClick={() => {
+                                 setUserMenuOpen(false);
+                                 setSettingsModalOpen(true);
+                              }}
+                              className="flex h-8 w-full items-center gap-2 rounded-md px-2 text-left text-[13px] text-muted-foreground transition-colors duration-150 hover:bg-surface-hover hover:text-foreground"
+                           >
+                              <Settings size={14} />
+                              Settings
+                           </button>
+                           <button
+                              type="button"
+                              onClick={signOutUser}
+                              className="flex h-8 w-full items-center gap-2 rounded-md px-2 text-left text-[13px] text-danger transition-colors duration-150 hover:bg-surface-hover"
+                           >
+                              <LogOut size={14} />
+                              Sign out
+                           </button>
+                        </div>
+                     ) : null}
+                  </>
+               ) : (
+                  <>
+                     <p className="mb-2 text-xs text-muted-foreground">
+                        Your results won&apos;t be saved permanently.
+                     </p>
+                     <button
+                        type="button"
+                        onClick={() => {
+                           setCheckoutError("");
+                           setAuthMode("sign-in");
+                           setUserModalOpen(true);
+                        }}
+                        className="flex h-8 w-full items-center justify-center gap-2 rounded-md border bg-surface px-3 text-[13px] font-medium text-foreground transition-colors duration-150 hover:bg-surface-hover"
+                     >
+                        <User size={14} />
+                        Sign in / Sign up
+                     </button>
+                  </>
+               )}
+            </div>
          </aside>
 
          <section
             className={[
                "sticky top-0 flex h-screen min-w-0 items-center justify-center overflow-auto border-r bg-background p-4",
                isDraggingFile ? "bg-surface-hover" : "",
+               !source ? "cursor-pointer" : "",
             ].join(" ")}
+            onClick={() => {
+               if (!source) {
+                  fileInputRef.current?.click();
+               }
+            }}
             onDragOver={(event) => {
                event.preventDefault();
                setIsDraggingFile(true);
@@ -1669,377 +1884,66 @@ export default function Home() {
             )}
          </section>
 
-         <aside className="flex h-screen min-h-0 flex-col bg-background">
-            <div className="flex h-[49px] items-center justify-between border-b px-4">
-               <div>
-                  <p className="text-[13px] font-medium leading-none">
-                     Outputs
-                  </p>
-                  <p className="mt-1 text-xs text-muted-foreground">
-                     Gemini and OpenAI rotate by region
-                  </p>
-               </div>
-               <button
-                  type="button"
-                  onClick={downloadAll}
-                  disabled={!canDownloadAll}
-                  className="flex h-8 items-center gap-2 rounded-md border bg-surface px-3 text-[13px] font-medium text-foreground transition-colors duration-150 hover:bg-surface-hover disabled:cursor-not-allowed disabled:text-subtle-foreground"
-               >
-                  <Archive size={14} />
-                  ZIP
-               </button>
-            </div>
+         <OutputPanel
+            settings={settings}
+            selections={selections}
+            results={results}
+            source={source}
+            cropPreviews={cropPreviews}
+            versionPrompts={versionPrompts}
+            setVersionPrompts={setVersionPrompts}
+            selectedId={selectedId}
+            isFastMode={isFastMode}
+            canDownloadAll={canDownloadAll}
+            onSelect={setSelectedId}
+            onDownloadAll={downloadAll}
+            onDownloadResult={downloadDataUrl}
+            onGenerateVersion={generateVersion}
+         />
 
-            <div className="min-h-0 flex-1 overflow-y-auto p-3">
-               {selections.length === 0 ? (
-                  <div className="flex h-full items-center justify-center text-center text-sm text-muted-foreground">
-                     Draw regions to prepare a batch.
-                  </div>
-               ) : (
-                  <div className="space-y-3">
-                     {selections.map((selection, index) => {
-                        const result = results[selection.id];
-                        const src = result ? resultDataUrl(result) : "";
-                        const isGenerating = result?.status === "processing";
-
-                        return (
-                           <div
-                              key={selection.id}
-                              className="rounded-lg border bg-surface p-3"
-                           >
-                              <div className="mb-2 flex items-center justify-between gap-2">
-                                 <button
-                                    type="button"
-                                    onClick={() => setSelectedId(selection.id)}
-                                    className="min-w-0 truncate text-left text-[13px] font-medium"
-                                 >
-                                    {index + 1}. {selection.name}
-                                 </button>
-                                 {result?.b64 && result.extension ? (
-                                    <button
-                                       type="button"
-                                       onClick={() =>
-                                          downloadDataUrl(
-                                             src,
-                                             `${slug(result.name) || result.id}.${result.extension}`,
-                                          )
-                                       }
-                                       className="text-muted-foreground hover:text-foreground"
-                                       aria-label={`Download ${selection.name}`}
-                                    >
-                                       <Download size={14} />
-                                    </button>
-                                 ) : null}
-                              </div>
-
-                              <div className="grid grid-cols-2 gap-2">
-                                 <div className="overflow-hidden rounded-md border bg-background">
-                                    {cropPreviews[selection.id] ? (
-                                       <img
-                                          src={cropPreviews[selection.id]}
-                                          alt=""
-                                          className="aspect-square h-full w-full object-contain"
-                                       />
-                                    ) : (
-                                       <div className="aspect-square" />
-                                    )}
-                                 </div>
-                                 <div className="overflow-hidden rounded-md border bg-background">
-                                    {isGenerating ? (
-                                       <div className="flex aspect-square items-center justify-center text-muted-foreground">
-                                          <Loader2
-                                             className="animate-spin"
-                                             size={18}
-                                          />
-                                       </div>
-                                    ) : result?.error ? (
-                                       <div className="flex aspect-square items-center justify-center px-2 text-center text-xs text-danger">
-                                          {result.error}
-                                       </div>
-                                    ) : src ? (
-                                       <img
-                                          src={src}
-                                          alt=""
-                                          className="aspect-square h-full w-full object-contain"
-                                       />
-                                    ) : (
-                                       <div className="flex aspect-square items-center justify-center text-xs text-subtle-foreground">
-                                          Pending
-                                       </div>
-                                    )}
-                                 </div>
-                              </div>
-
-                              <div className="mt-2 flex items-center justify-between text-xs text-subtle-foreground">
-                                 <span>
-                                    {result?.model ??
-                                       (index % 2 === 0 ? "Gemini" : "OpenAI")}
-                                 </span>
-                                 <span>
-                                    {result?.width && result.height
-                                       ? `${result.width}x${result.height}`
-                                       : `${Math.round(selection.w)}x${Math.round(selection.h)}`}
-                                 </span>
-                              </div>
-
-                              <div className="mt-3 border-t pt-3">
-                                 {!isFastMode ? (
-                                    <label className="block text-xs text-muted-foreground">
-                                       Prompt
-                                       <textarea
-                                          value={
-                                             versionPrompts[selection.id] ?? ""
-                                          }
-                                          onChange={(event) =>
-                                             setVersionPrompts((current) => ({
-                                                ...current,
-                                                [selection.id]:
-                                                   event.target.value,
-                                             }))
-                                          }
-                                          placeholder="Version direction"
-                                          rows={2}
-                                          className="mt-1 h-16 w-full resize-none rounded-md border bg-surface px-3 py-2 text-[13px] text-foreground outline-none transition-colors duration-150 placeholder:text-subtle-foreground focus:border-accent"
-                                       />
-                                    </label>
-                                 ) : (
-                                    <p className="text-xs text-muted-foreground">
-                                       Runs locally with Sharp. No AI checkout
-                                       required.
-                                    </p>
-                                 )}
-                                 <button
-                                    type="button"
-                                    onClick={() =>
-                                       generateVersion(selection, index)
-                                    }
-                                    disabled={!source || isGenerating}
-                                    className="mt-2 flex h-8 w-full items-center justify-center gap-2 rounded-md border bg-surface px-3 text-[13px] font-medium text-foreground transition-colors duration-150 hover:bg-surface-hover disabled:cursor-not-allowed disabled:text-subtle-foreground"
-                                 >
-                                    {isGenerating ? (
-                                       <Loader2
-                                          className="animate-spin"
-                                          size={14}
-                                       />
-                                    ) : (
-                                       <RefreshCw size={14} />
-                                    )}
-                                    {isFastMode
-                                       ? "Run fast tool"
-                                       : "New version"}
-                                 </button>
-                              </div>
-                           </div>
-                        );
-                     })}
-                  </div>
-               )}
-            </div>
-         </aside>
+         {settingsModalOpen ? (
+            <SettingsModal
+               settings={settings}
+               setSettings={setSettings}
+               onClose={() => setSettingsModalOpen(false)}
+            />
+         ) : null}
 
          {userModalOpen ? (
-            <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4 backdrop-blur">
-               <div className="w-full max-w-[480px] rounded-xl border border-border-strong bg-[#0A0A0A]">
-                  <div className="flex items-start justify-between border-b px-4 py-3">
-                     <div>
-                        <p className="text-[13px] font-medium leading-none">
-                           User
-                        </p>
-                        <p className="mt-1 text-xs text-muted-foreground">
-                           Saved locally on this browser
-                        </p>
-                     </div>
-                     <button
-                        type="button"
-                        onClick={() => setUserModalOpen(false)}
-                        className="text-muted-foreground transition-colors duration-150 hover:text-foreground"
-                        aria-label="Close user"
-                     >
-                        <X size={16} />
-                     </button>
-                  </div>
-
-                  <div className="space-y-4 p-4">
-                     <label className="block text-xs text-muted-foreground">
-                        Email
-                        <div className="mt-1 flex h-8 items-center gap-2 rounded-md border bg-surface px-3 focus-within:border-accent">
-                           <Mail size={14} />
-                           <input
-                              value={checkoutEmail}
-                              onChange={(event) =>
-                                 setCheckoutEmail(event.target.value)
-                              }
-                              onKeyDown={(event) => {
-                                 if (event.key === "Enter") {
-                                    saveUserEmail();
-                                 }
-                              }}
-                              type="email"
-                              placeholder="you@example.com"
-                              className="min-w-0 flex-1 bg-transparent text-[13px] text-foreground outline-none placeholder:text-subtle-foreground"
-                           />
-                        </div>
-                     </label>
-
-                     {checkoutError ? (
-                        <p className="rounded-md border border-danger/50 bg-surface px-3 py-2 text-xs text-danger">
-                           {checkoutError}
-                        </p>
-                     ) : null}
-
-                     <div className="flex items-center justify-end gap-2">
-                        <button
-                           type="button"
-                           onClick={() => setUserModalOpen(false)}
-                           className="flex h-8 items-center justify-center rounded-md border bg-surface px-3 text-[13px] font-medium text-foreground transition-colors duration-150 hover:bg-surface-hover"
-                        >
-                           Cancel
-                        </button>
-                        <button
-                           type="button"
-                           onClick={saveUserEmail}
-                           className="flex h-8 items-center justify-center gap-2 rounded-md bg-accent px-3 text-[13px] font-medium text-accent-foreground transition-colors duration-150 hover:bg-accent-hover"
-                        >
-                           <User size={14} />
-                           Save user
-                        </button>
-                     </div>
-                  </div>
-               </div>
-            </div>
+            <UserModal
+               authMode={authMode}
+               setAuthMode={setAuthMode}
+               checkoutEmail={checkoutEmail}
+               setCheckoutEmail={setCheckoutEmail}
+               checkoutPassword={checkoutPassword}
+               setCheckoutPassword={setCheckoutPassword}
+               checkoutError={checkoutError}
+               clearCheckoutError={() => setCheckoutError("")}
+               onSubmit={() => void saveUserEmail()}
+               onSignOut={signOutUser}
+               onClose={() => setUserModalOpen(false)}
+            />
          ) : null}
 
          {paymentModalOpen ? (
-            <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4 backdrop-blur">
-               <div className="w-full max-w-[480px] rounded-xl border border-border-strong bg-[#0A0A0A]">
-                  <div className="flex items-start justify-between border-b px-4 py-3">
-                     <div>
-                        <p className="text-[13px] font-medium leading-none">
-                           Choose a plan
-                        </p>
-                        <p className="mt-1 text-xs text-muted-foreground">
-                           {selections.length} selected section
-                           {selections.length === 1 ? "" : "s"} ready
-                        </p>
-                     </div>
-                     <button
-                        type="button"
-                        onClick={() => setPaymentModalOpen(false)}
-                        className="text-muted-foreground transition-colors duration-150 hover:text-foreground"
-                        aria-label="Close checkout"
-                     >
-                        <X size={16} />
-                     </button>
-                  </div>
-
-                  <div className="space-y-4 p-4">
-                     <div className="space-y-2">
-                        {pricingPlans.map((plan) => {
-                           const selected = selectedPlanId === plan.id;
-
-                           return (
-                              <button
-                                 key={plan.id}
-                                 type="button"
-                                 onClick={() => setSelectedPlanId(plan.id)}
-                                 className={[
-                                    "w-full rounded-lg border bg-surface p-3 text-left transition-colors duration-150 hover:bg-surface-hover",
-                                    selected
-                                       ? "border-accent bg-surface-active"
-                                       : "",
-                                 ].join(" ")}
-                              >
-                                 <div className="flex items-center justify-between gap-3">
-                                    <div className="min-w-0">
-                                       <div className="flex items-center gap-2">
-                                          <p className="text-[13px] font-medium">
-                                             {plan.name}
-                                          </p>
-                                          {plan.id === "pro" ? (
-                                             <span className="rounded border border-accent/60 px-1.5 py-0.5 text-[10px] uppercase leading-none text-accent">
-                                                Popular
-                                             </span>
-                                          ) : null}
-                                       </div>
-                                       <p className="mt-1 text-xs text-muted-foreground">
-                                          {plan.credits} · {plan.note}
-                                       </p>
-                                    </div>
-                                    <p className="text-[18px] font-semibold tracking-[-0.01em]">
-                                       {plan.price}
-                                    </p>
-                                 </div>
-                              </button>
-                           );
-                        })}
-                        <div className="grid grid-cols-3 gap-2 text-center text-xs text-muted-foreground">
-                           <div className="rounded-md border bg-background px-2 py-2">
-                              {selections.length} now
-                           </div>
-                           <div className="rounded-md border bg-background px-2 py-2">
-                              ZIP export
-                           </div>
-                           <div className="rounded-md border bg-background px-2 py-2">
-                              Prompt edits
-                           </div>
-                        </div>
-                     </div>
-
-                     <label className="block text-xs text-muted-foreground">
-                        Recovery email
-                        <div className="mt-1 flex h-8 items-center gap-2 rounded-md border bg-surface px-3 focus-within:border-accent">
-                           <Mail size={14} />
-                           <input
-                              value={checkoutEmail}
-                              onChange={(event) =>
-                                 setCheckoutEmail(event.target.value)
-                              }
-                              type="email"
-                              placeholder="you@example.com"
-                              className="min-w-0 flex-1 bg-transparent text-[13px] text-foreground outline-none placeholder:text-subtle-foreground"
-                           />
-                        </div>
-                     </label>
-
-                     <p className="rounded-md border bg-surface px-3 py-2 text-xs text-muted-foreground">
-                        No login is required. Without an account, the browser
-                        session keeps the original image; if you leave or clear
-                        it before persistence is complete, the image may not be
-                        recoverable even though the payment record is tied to
-                        this email.
-                     </p>
-
-                     {checkoutError ? (
-                        <p className="rounded-md border border-danger/50 bg-surface px-3 py-2 text-xs text-danger">
-                           {checkoutError}
-                        </p>
-                     ) : null}
-
-                     <div className="flex items-center justify-end gap-2">
-                        <button
-                           type="button"
-                           onClick={() => setPaymentModalOpen(false)}
-                           className="flex h-8 items-center justify-center rounded-md border bg-surface px-3 text-[13px] font-medium text-foreground transition-colors duration-150 hover:bg-surface-hover"
-                        >
-                           Cancel
-                        </button>
-                        <button
-                           type="button"
-                           onClick={startPolarCheckout}
-                           disabled={isCheckoutLoading}
-                           className="flex h-8 items-center justify-center gap-2 rounded-md bg-accent px-3 text-[13px] font-medium text-accent-foreground transition-colors duration-150 hover:bg-accent-hover disabled:cursor-not-allowed disabled:bg-surface disabled:text-subtle-foreground"
-                        >
-                           {isCheckoutLoading ? (
-                              <Loader2 className="animate-spin" size={14} />
-                           ) : (
-                              <CreditCard size={14} />
-                           )}
-                           Continue with {selectedPlan.name}
-                        </button>
-                     </div>
-                  </div>
-               </div>
-            </div>
+            <PaymentModal
+               checkoutIntent={checkoutIntent}
+               checkoutEmail={checkoutEmail}
+               setCheckoutEmail={setCheckoutEmail}
+               checkoutPassword={checkoutPassword}
+               setCheckoutPassword={setCheckoutPassword}
+               checkoutError={checkoutError}
+               clearCheckoutError={() => setCheckoutError("")}
+               authMode={authMode}
+               setAuthMode={setAuthMode}
+               selectedPlanId={selectedPlanId}
+               setSelectedPlanId={setSelectedPlanId}
+               selectedPlan={selectedPlan}
+               selectionsLength={selections.length}
+               isCheckoutLoading={isCheckoutLoading}
+               onContinue={() => void continueCheckout()}
+               onClose={() => setPaymentModalOpen(false)}
+            />
          ) : null}
       </main>
    );
