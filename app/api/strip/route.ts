@@ -535,9 +535,10 @@ async function assertPaid(
 async function recordGenerationUsage(
   payment: StripRequest["payment"],
   jobId: string | undefined,
+  cropIds: string[],
   requestedCount: number,
   fulfilledCount: number,
-) {
+): Promise<boolean> {
   const email = payment?.email?.trim().toLowerCase();
 
   if (
@@ -545,7 +546,7 @@ async function recordGenerationUsage(
     isOwnerEmail(email) ||
     process.env.PAYMENT_REQUIRED === "false"
   ) {
-    return;
+    return true;
   }
 
   const customerState = await getPolarCustomerStateByExternalId(email).catch(
@@ -556,19 +557,34 @@ async function recordGenerationUsage(
     customerState &&
     (hasLifetimeAccess(customerState) || hasActiveSubscription(customerState))
   ) {
-    return;
+    return true;
   }
 
-  await ingestPolarUsageEvent({
-    email,
-    jobId,
-    credits: requestedCount,
-    selectionCount: requestedCount,
-    fulfilledCount,
-    failedCount: Math.max(0, requestedCount - fulfilledCount),
-  }).catch((error) => {
-    console.error("polar.usage_ingest_failed", error);
-  });
+  // stable idempotency key: job + sorted crop ids, prevents double-billing on retries
+  const eventId = jobId
+    ? `${jobId}-${[...cropIds].sort().join(",")}`
+    : undefined;
+
+  try {
+    await ingestPolarUsageEvent({
+      email,
+      jobId,
+      eventId,
+      credits: requestedCount,
+      selectionCount: requestedCount,
+      fulfilledCount,
+      failedCount: Math.max(0, requestedCount - fulfilledCount),
+    });
+    return true;
+  } catch (error) {
+    console.error("polar.usage_ingest_failed", {
+      email,
+      jobId,
+      eventId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return false;
+  }
 }
 
 export async function POST(request: Request) {
@@ -654,14 +670,16 @@ export async function POST(request: Request) {
       });
     }
 
-    await recordGenerationUsage(
+    const creditsRecorded = await recordGenerationUsage(
       body.payment,
       body.payment?.jobId,
+      body.crops.map((c) => c.id),
       body.crops.length,
       fulfilledCount,
     );
 
     return Response.json({
+      creditsRecorded,
       results: settled.map((result, index) => {
         if (result.status === "fulfilled") {
           return result.value;

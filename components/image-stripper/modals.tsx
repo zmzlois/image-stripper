@@ -11,6 +11,7 @@ import type { Dispatch, SetStateAction } from "react";
 import { modelOptions, pricingPlans } from "@/lib/image-stripper/config";
 import type {
    AuthMode,
+   BillingState,
    CheckoutIntent,
    PricingPlan,
    PricingPlanId,
@@ -156,6 +157,7 @@ type UserModalProps = {
    setCheckoutPassword: (password: string) => void;
    checkoutError: string;
    clearCheckoutError: () => void;
+   billingState?: BillingState | null;
    onSubmit: () => void;
    onSignOut: () => void;
    onClose: () => void;
@@ -170,6 +172,7 @@ export function UserModal({
    setCheckoutPassword,
    checkoutError,
    clearCheckoutError,
+   billingState,
    onSubmit,
    onSignOut,
    onClose,
@@ -202,6 +205,32 @@ export function UserModal({
                   setAuthMode={setAuthMode}
                   clearError={clearCheckoutError}
                />
+
+               {billingState && billingState.kind !== "anonymous" ? (
+                  <div className="rounded-md border bg-surface px-3 py-2.5">
+                     <p className="text-[11px] uppercase tracking-wide text-subtle-foreground">
+                        Current plan
+                     </p>
+                     {billingState.kind === "unlimited" ? (
+                        <p className="mt-1 text-[13px] font-medium text-success">
+                           {billingState.label}
+                        </p>
+                     ) : billingState.kind === "credits" ? (
+                        <div className="mt-1 flex items-baseline gap-2">
+                           <p className="text-[13px] font-medium">
+                              {billingState.balance}
+                           </p>
+                           <p className="text-xs text-muted-foreground">
+                              credit{billingState.balance === 1 ? "" : "s"} remaining
+                           </p>
+                        </div>
+                     ) : billingState.kind === "none" ? (
+                        <p className="mt-1 text-[13px] text-muted-foreground">
+                           No active plan
+                        </p>
+                     ) : null}
+                  </div>
+               ) : null}
 
                <label className="block text-xs text-muted-foreground">
                   Email

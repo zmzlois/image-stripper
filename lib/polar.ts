@@ -254,6 +254,7 @@ export async function getPolarCustomerStateByExternalId(externalId: string) {
 export async function ingestPolarUsageEvent({
   email,
   jobId,
+  eventId,
   credits,
   selectionCount,
   fulfilledCount,
@@ -261,6 +262,7 @@ export async function ingestPolarUsageEvent({
 }: {
   email: string;
   jobId?: string;
+  eventId?: string;
   credits: number;
   selectionCount: number;
   fulfilledCount: number;
@@ -272,6 +274,8 @@ export async function ingestPolarUsageEvent({
 
   await polarFetch<{ inserted: number }>("/v1/events/ingest", {
     method: "POST",
+    // idempotency key prevents double-charging on network retries or double-clicks
+    headers: eventId ? { "Idempotency-Key": eventId } : undefined,
     body: JSON.stringify({
       events: [
         {
@@ -280,6 +284,7 @@ export async function ingestPolarUsageEvent({
           metadata: {
             credits,
             job_id: jobId || "",
+            event_id: eventId || "",
             selection_count: selectionCount,
             fulfilled_count: fulfilledCount,
             failed_count: failedCount,

@@ -24,9 +24,7 @@ import {
    useState,
    type PointerEvent as ReactPointerEvent,
 } from "react";
-import {
-   OutputPanel,
-} from "@/components/image-stripper/output-panel";
+import { OutputPanel } from "@/components/image-stripper/output-panel";
 import {
    PaymentModal,
    SettingsModal,
@@ -344,12 +342,12 @@ export default function Home() {
             .then(() => syncHistoryToVercelBlob(entry, email))
             .then((syncedToBlob) => {
                setSaveNotice(
-                  syncedToBlob
-                     ? "Saved to Vercel Blob."
-                     : "Saved on this browser.",
+                  syncedToBlob ? "Saved to" : "Saved on this browser.",
                );
             })
-            .catch(() => setSaveNotice("Saved locally. Blob save failed."));
+            .catch(() =>
+               setSaveNotice("Saved locally, failed to save to storage."),
+            );
       }, 500);
 
       return () => window.clearTimeout(saveTimer);
@@ -779,7 +777,9 @@ export default function Home() {
 
       if (!isSuperAdminEmail(email) && !checkoutPassword) {
          setCheckoutError(
-            authMode === "sign-up" ? "Choose a password." : "Enter your password.",
+            authMode === "sign-up"
+               ? "Choose a password."
+               : "Enter your password.",
          );
          return false;
       }
@@ -949,6 +949,7 @@ export default function Home() {
          });
          const payload = (await response.json()) as {
             results?: StripResult[];
+            creditsRecorded?: boolean;
             error?: string;
          };
 
@@ -965,14 +966,8 @@ export default function Home() {
 
          const merged = { ...resultsRef.current, ...nextResults };
          commitResults(merged);
-         setBillingState((current) =>
-            current?.kind === "credits"
-               ? {
-                    ...current,
-                    balance: Math.max(0, current.balance - crops.length),
-                 }
-               : current,
-         );
+         // always refresh from server so balance reflects what polar actually recorded
+         setBillingRefreshKey((k) => k + 1);
          await saveJob(merged);
       } catch (error) {
          const message =
@@ -1045,6 +1040,7 @@ export default function Home() {
          });
          const payload = (await response.json()) as {
             results?: StripResult[];
+            creditsRecorded?: boolean;
             error?: string;
          };
 
@@ -1060,14 +1056,8 @@ export default function Home() {
 
          const merged = { ...resultsRef.current, [selection.id]: result };
          commitResults(merged);
-         setBillingState((current) =>
-            current?.kind === "credits"
-               ? {
-                    ...current,
-                    balance: Math.max(0, current.balance - 1),
-                 }
-               : current,
-         );
+         // always refresh from server so balance reflects what polar actually recorded
+         setBillingRefreshKey((k) => k + 1);
          await saveJob(merged);
       } catch (error) {
          const message =
@@ -1216,6 +1206,10 @@ export default function Home() {
                localStorage.setItem("image-stripper-email", payload.email);
             }
             setBillingRefreshKey((current) => current + 1);
+            // polar's meter_credit benefit is granted asynchronously after checkout —
+            // poll a couple more times to catch it once it arrives
+            setTimeout(() => setBillingRefreshKey((k) => k + 1), 2500);
+            setTimeout(() => setBillingRefreshKey((k) => k + 1), 6000);
             setPaymentModalOpen(false);
             setBatchError("");
             setPaymentNotice(
@@ -1919,6 +1913,7 @@ export default function Home() {
                setCheckoutPassword={setCheckoutPassword}
                checkoutError={checkoutError}
                clearCheckoutError={() => setCheckoutError("")}
+               billingState={billingStateMatchesEmail ? billingState : null}
                onSubmit={() => void saveUserEmail()}
                onSignOut={signOutUser}
                onClose={() => setUserModalOpen(false)}
